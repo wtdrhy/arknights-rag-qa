@@ -1,0 +1,27 @@
+# 虚拟环境
+.venv/
+venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 密钥（放 API Key，绝不能提交）
+.env
+
+# 抓取的数据（体量大 + 版权考虑，不入库）
+#
+# 注意写法：必须是 data/* 而不是 data/。
+# 写 data/ 的话 git 根本不会进入这个目录，下面的例外规则就失效了。
+data/*
+
+# 但评测用例是**代码资产**，不是数据产物 —— 必须入库，
+# 否则别人 clone 下来跑不了 19_regression.py。
+!data/eval_cases.json
+
+# 日志
+*.log
+
+# PyCharm
+.idea/
