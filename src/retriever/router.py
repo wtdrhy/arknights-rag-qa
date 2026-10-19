@@ -382,11 +382,11 @@ SQL_TEMPLATES = {
         "JOIN operators o ON o.id=m.operator_id WHERE o.name IN ({ph})\n"
         ") t GROUP BY t.material ORDER BY 总数量 DESC"
     ),
-    # 满练度**分阶段养成清单**（第 11 步用户反馈后新增）。
+    # 满练度**分阶段养成清单**（第 11 步用户反馈后新增，第 11 步补丁补齐等级段）。
     #
     # 用户看不懂一列揉在一起的"总量"——材料花在哪个阶段完全看不出来。
-    # 真实的练度规划是分阶段的：精英化1、精英化2、技能2~7级、
-    # 三个技能各自的专精1~3、每个模组的 1~3 级。
+    # 真实的练度规划是分阶段的：精英0 升到 50 → 精英化1 → 精英1 升到 80
+    # → 精英化2 → 精英2 升到 90 → 技能2~7级 → 三个技能的专精1~3 → 模组。
     #
     # 输出三段，全部由 SQL 计算，LLM 只转述：
     #   ① 明细段（a/b/c/d 开头）：每行原始归属，信息无损
@@ -396,60 +396,125 @@ SQL_TEMPLATES = {
     #      合并这种计算必须由 SQL 做，模型引用【小计】段即可
     #   ③ 总计段（zz）：全阶段 SUM
     #
-    # ord 列纯粹为了排序（a 精英化 → b 技能 → c 专精 → d 模组 → e 小计 → zz 总计）。
-    # {ph} 出现次数较多（各子查询 + 小计 + 总计段都要按名字过滤），
-    # 调用方按 SQL 里的实际出现次数复制参数，不手写数字。
+    # 【为什么整体用 WITH 而不是每段各查一遍】
+    # 上一版明细/小计/总计**各自 FROM 一遍表**，加一个数据源就要在多处
+    # 复制同样的过滤条件，存在"明细改了、小计没改"的静默不一致。
+    # 现在原始行只定义一次（raw），小计和总计都从 raw GROUP BY 派生，
+    # 结构上保证三者必然自洽。补等级段时这个改动省掉了三处重复修改。
+    #
+    # grp = 小计分组键：g0/g1/g2 等级段（不参与小计）、
+    #   s0 技能升级、s1~s3 各技能专精、m1/m2 各模组。
+    #
+    # ord 的字典序就是养成顺序：
+    #   a010 精英0升级 → a10 精英化1 → a110 精英1升级
+    #   → a20 精英化2 → a210 精英2升级 → b 技能 → c 专精 → d 模组
+    #   → e 小计 → zz 总计
     "train_plan": (
-        "SELECT t.阶段 AS 阶段, t.材料 AS 材料, t.数量 AS 数量 FROM (\n"
-        "  SELECT CASE e.stage WHEN '精1' THEN 'a1' ELSE 'a2' END AS ord,\n"
-        "         ('精英化' || substr(e.stage, 2, 1)) AS 阶段,\n"
-        "         e.material AS 材料, e.amount AS 数量\n"
-        "  FROM elite_materials e JOIN operators o ON o.id=e.operator_id "
-        "WHERE o.name IN ({ph})\n"
-        "  UNION ALL SELECT ('b0' || sm.target_level) AS ord,\n"
-        "         ('技能升到' || sm.target_level || '级') AS 阶段,\n"
-        "         sm.material AS 材料, sm.amount AS 数量\n"
-        "  FROM skill_materials sm JOIN operators o ON o.id=sm.operator_id "
-        "WHERE o.name IN ({ph}) AND sm.is_mastery=0\n"
-        "  UNION ALL SELECT ('c' || sm.skill_idx || '0' || sm.mastery_lv) AS ord,\n"
-        "         ('技能' || sm.skill_idx || ' 专精' || sm.mastery_lv) AS 阶段,\n"
-        "         sm.material AS 材料, sm.amount AS 数量\n"
-        "  FROM skill_materials sm JOIN operators o ON o.id=sm.operator_id "
-        "WHERE o.name IN ({ph}) AND sm.is_mastery=1\n"
-        "  UNION ALL SELECT ('d' || m.idx || '0' || mm.level) AS ord,\n"
-        "         ('模组' || m.idx || ' 升到' || mm.level || '级') AS 阶段,\n"
-        "         mm.material AS 材料, mm.amount AS 数量\n"
-        "  FROM module_materials mm JOIN modules m ON m.id=mm.module_id "
-        "JOIN operators o ON o.id=m.operator_id WHERE o.name IN ({ph})\n"
-        "  UNION ALL SELECT 'e0' AS ord, '【小计】技能升级2-7级' AS 阶段,\n"
-        "         s.material AS 材料, s.total AS 数量 FROM (\n"
-        "    SELECT sm.material, SUM(sm.amount) AS total\n"
-        "    FROM skill_materials sm JOIN operators o ON o.id=sm.operator_id "
-        "WHERE o.name IN ({ph}) AND sm.is_mastery=0 GROUP BY sm.material\n"
-        "  ) s\n"
-        "  UNION ALL SELECT ('e' || sm.skill_idx) AS ord,\n"
-        "         ('【小计】技能' || sm.skill_idx || '专精') AS 阶段,\n"
-        "         sm.material AS 材料, SUM(sm.amount) AS 数量\n"
-        "  FROM skill_materials sm JOIN operators o ON o.id=sm.operator_id "
-        "WHERE o.name IN ({ph}) AND sm.is_mastery=1 GROUP BY sm.skill_idx, sm.material\n"
-        "  UNION ALL SELECT ('e4' || m.idx) AS ord,\n"
-        "         ('【小计】模组' || m.idx) AS 阶段,\n"
-        "         mm.material AS 材料, SUM(mm.amount) AS 数量\n"
-        "  FROM module_materials mm JOIN modules m ON m.id=mm.module_id "
-        "JOIN operators o ON o.id=m.operator_id WHERE o.name IN ({ph})\n"
-        "  GROUP BY m.idx, mm.material\n"
-        "  UNION ALL SELECT 'zz' AS ord, '【总计】全阶段合计' AS 阶段,\n"
-        "         g.material AS 材料, g.total AS 数量 FROM (\n"
-        "    SELECT u.material AS material, SUM(u.amount) AS total FROM (\n"
-        "      SELECT e.material, e.amount FROM elite_materials e "
-        "JOIN operators o ON o.id=e.operator_id WHERE o.name IN ({ph})\n"
-        "      UNION ALL SELECT sm.material, sm.amount FROM skill_materials sm "
-        "JOIN operators o ON o.id=sm.operator_id WHERE o.name IN ({ph})\n"
-        "      UNION ALL SELECT mm.material, mm.amount FROM module_materials mm "
-        "JOIN modules m ON m.id=mm.module_id "
-        "JOIN operators o ON o.id=m.operator_id WHERE o.name IN ({ph})\n"
-        "    ) u GROUP BY u.material\n"
-        "  ) g\n"
+        "WITH raw AS (\n"
+        "  SELECT ('a' || lc.elite || '10') AS ord, ('g' || lc.elite) AS grp,\n"
+        "         ('【升级】精英' || lc.elite || ' 1→' || lc.max_level || '级') AS 阶段,\n"
+        "         '龙门币' AS 材料, c.money_cum AS 数量\n"
+        "  FROM level_cap lc JOIN operators o ON o.rarity=lc.rarity\n"
+        "  JOIN level_up_cost c ON c.elite=lc.elite AND c.level=lc.max_level\n"
+        "  WHERE o.name IN ({ph})\n"
+        "  UNION ALL\n"
+        "  SELECT ('a' || lc.elite || '11'), ('g' || lc.elite),\n"
+        "         ('【升级】精英' || lc.elite || ' 1→' || lc.max_level || '级'),\n"
+        "         '经验值', c.exp_cum\n"
+        "  FROM level_cap lc JOIN operators o ON o.rarity=lc.rarity\n"
+        "  JOIN level_up_cost c ON c.elite=lc.elite AND c.level=lc.max_level\n"
+        "  WHERE o.name IN ({ph})\n"
+        "  UNION ALL\n"
+        "  SELECT ('a' || lc.elite || '12'), ('g' || lc.elite),\n"
+        "         ('【升级】精英' || lc.elite || ' 1→' || lc.max_level || '级'),\n"
+        "         ('≈' || (SELECT name FROM exp_card ORDER BY exp_value DESC LIMIT 1)),\n"
+        "         CAST((c.exp_cum + (SELECT MAX(exp_value) FROM exp_card) - 1)\n"
+        "              / (SELECT MAX(exp_value) FROM exp_card) AS INTEGER)\n"
+        "  FROM level_cap lc JOIN operators o ON o.rarity=lc.rarity\n"
+        "  JOIN level_up_cost c ON c.elite=lc.elite AND c.level=lc.max_level\n"
+        "  WHERE o.name IN ({ph})\n"
+        "  UNION ALL\n"
+        "  SELECT CASE e.stage WHEN '精1' THEN 'a10' ELSE 'a20' END,\n"
+        "         ('e' || substr(e.stage, 2, 1)),\n"
+        "         ('精英化' || substr(e.stage, 2, 1)), e.material, e.amount\n"
+        "  FROM elite_materials e JOIN operators o ON o.id=e.operator_id\n"
+        "  WHERE o.name IN ({ph})\n"
+        "  UNION ALL\n"
+        "  SELECT ('b0' || sm.target_level), 's0',\n"
+        "         ('技能升到' || sm.target_level || '级'), sm.material, sm.amount\n"
+        "  FROM skill_materials sm JOIN operators o ON o.id=sm.operator_id\n"
+        "  WHERE o.name IN ({ph}) AND sm.is_mastery=0\n"
+        "  UNION ALL\n"
+        "  SELECT ('c' || sm.skill_idx || '0' || sm.mastery_lv), ('s' || sm.skill_idx),\n"
+        "         ('技能' || sm.skill_idx || ' 专精' || sm.mastery_lv),\n"
+        "         sm.material, sm.amount\n"
+        "  FROM skill_materials sm JOIN operators o ON o.id=sm.operator_id\n"
+        "  WHERE o.name IN ({ph}) AND sm.is_mastery=1\n"
+        "  UNION ALL\n"
+        "  SELECT ('d' || m.idx || '0' || mm.level), ('m' || m.idx),\n"
+        "         ('模组' || m.idx || ' 升到' || mm.level || '级'),\n"
+        "         mm.material, mm.amount\n"
+        "  FROM module_materials mm JOIN modules m ON m.id=mm.module_id\n"
+        "  JOIN operators o ON o.id=m.operator_id WHERE o.name IN ({ph})\n"
+        "), sub AS (\n"
+        "  SELECT grp, 材料, SUM(数量) AS 数量 FROM raw\n"
+        "  WHERE grp LIKE 's%' OR grp LIKE 'm%' GROUP BY grp, 材料\n"
+        ")\n"
+        "SELECT 阶段, 材料, 数量 FROM (\n"
+        "  SELECT ord, 阶段, 材料, 数量 FROM raw\n"
+        "  UNION ALL\n"
+        "  SELECT CASE substr(s.grp, 1, 1)\n"
+        "           WHEN 's' THEN CASE s.grp WHEN 's0' THEN 'e00'\n"
+        "                        ELSE 'e' || substr(s.grp, 2) END\n"
+        "           ELSE 'e4' || substr(s.grp, 2) END,\n"
+        "         CASE WHEN s.grp='s0' THEN '【小计】技能升级2-7级'\n"
+        "              WHEN substr(s.grp, 1, 1)='s'\n"
+        "                   THEN '【小计】技能' || substr(s.grp, 2) || '专精'\n"
+        "              ELSE '【小计】模组' || substr(s.grp, 2) END,\n"
+        "         s.材料, s.数量\n"
+        "  FROM sub s\n"
+        "  UNION ALL\n"
+        "  SELECT 'zz', '【总计】全阶段合计', r.材料, SUM(r.数量)\n"
+        "  FROM raw r WHERE r.材料 NOT LIKE '≈%' GROUP BY r.材料\n"
+        "  UNION ALL\n"
+        # 作战记录总张数必须**对总经验取整一次**，
+        # 不能把各阶段分别取整后的张数相加（24400→13 张 + … ≠ 总量→556 张）。
+        "  SELECT 'zz1', '【总计】全阶段合计',\n"
+        "         ('≈' || (SELECT name FROM exp_card ORDER BY exp_value DESC LIMIT 1)),\n"
+        "         CAST((t.total + v.v - 1) / v.v AS INTEGER)\n"
+        "  FROM (SELECT SUM(数量) AS total FROM raw WHERE 材料='经验值') t,\n"
+        "       (SELECT MAX(exp_value) AS v FROM exp_card) v\n"
+        ") ORDER BY ord"
+    ),
+    # 单独问"升到 N 级要多少经验/作战记录"时用。
+    #
+    # 为什么不能复用 train_plan：那条会连带返回精英化、技能、模组的一百多行，
+    # 而用户只问了等级这一段 —— 答非所问的冗余同样是错误答案。
+    # 只给等级段：每个精英阶段的经验、龙门币、折算的作战记录张数。
+    "level_cost": (
+        "SELECT t.阶段 AS 阶段, t.项目 AS 项目, t.数量 AS 数量 FROM (\n"
+        "  SELECT ('a' || lc.elite || '0') AS ord,\n"
+        "         ('精英' || lc.elite || ' 1→' || lc.max_level || '级') AS 阶段,\n"
+        "         '经验值' AS 项目, c.exp_cum AS 数量\n"
+        "  FROM level_cap lc JOIN operators o ON o.rarity=lc.rarity\n"
+        "  JOIN level_up_cost c ON c.elite=lc.elite AND c.level=lc.max_level\n"
+        "  WHERE o.name IN ({ph})\n"
+        "  UNION ALL\n"
+        "  SELECT ('a' || lc.elite || '1'),\n"
+        "         ('精英' || lc.elite || ' 1→' || lc.max_level || '级'),\n"
+        "         '龙门币', c.money_cum\n"
+        "  FROM level_cap lc JOIN operators o ON o.rarity=lc.rarity\n"
+        "  JOIN level_up_cost c ON c.elite=lc.elite AND c.level=lc.max_level\n"
+        "  WHERE o.name IN ({ph})\n"
+        "  UNION ALL\n"
+        "  SELECT ('a' || lc.elite || '2'),\n"
+        "         ('精英' || lc.elite || ' 1→' || lc.max_level || '级'),\n"
+        "         ('≈' || (SELECT name FROM exp_card ORDER BY exp_value DESC LIMIT 1)),\n"
+        "         CAST((c.exp_cum + (SELECT MAX(exp_value) FROM exp_card) - 1)\n"
+        "              / (SELECT MAX(exp_value) FROM exp_card) AS INTEGER)\n"
+        "  FROM level_cap lc JOIN operators o ON o.rarity=lc.rarity\n"
+        "  JOIN level_up_cost c ON c.elite=lc.elite AND c.level=lc.max_level\n"
+        "  WHERE o.name IN ({ph})\n"
         ") t ORDER BY t.ord"
     ),
 }
@@ -480,7 +545,12 @@ def pick_sql(question: str,
     ph = ",".join("?" * len(entities))
     params = tuple(entities)
 
-    if any(w in q for w in ("材料", "消耗", "需要", "龙门币", "芯片")):
+    # 等级消耗要单独判，且**排在"技能/专精"之后**：
+    # "技能升级材料"里也含"升级"二字，判早了会把技能材料问题抢走。
+    LEVEL_SIGNALS = ("经验", "作战记录", "升级消耗", "练到", "升到", "升满")
+
+    if any(w in q for w in ("材料", "消耗", "需要", "龙门币", "芯片")) or \
+            any(w in q for w in LEVEL_SIGNALS):
         # 先判"要总数"，再判"要哪张表的明细"。顺序不能反：
         # "满练度总共要多少材料" 也含"技能"二字，
         # 但用户要的是三表合计，不是技能那一列的流水账。
@@ -493,6 +563,12 @@ def pick_sql(question: str,
             return tpl.format(ph=ph), params * n_ph, "plan"
         if any(w in q for w in ("专精", "技能")):
             return SQL_TEMPLATES["skill_material"].format(ph=ph), params, "detail"
+        # 只问等级这一段（"升到90级要多少经验"）：
+        # 给完整清单会把精英化/技能/模组的一百多行一起倒出来，答非所问。
+        if any(w in q for w in LEVEL_SIGNALS):
+            tpl = SQL_TEMPLATES["level_cost"]
+            n_ph = tpl.count("{ph}")
+            return tpl.format(ph=ph), params * n_ph, "plan"
         return SQL_TEMPLATES["elite_material"].format(ph=ph), params, "detail"
     if any(w in q for w in ("面板", "满级", "攻击力", "防御", "生命", "法抗", "属性")):
         return SQL_TEMPLATES["max_stats"].format(ph=ph), params, "detail"
@@ -590,5 +666,22 @@ def route(question: str, matcher: EntityMatcher) -> Route:
             r.sql_params = tuple(r.entities)
             r.sql_kind = "detail"
             r.reason.append("复合问题无匹配模板，默认取满级面板作数值依据")
+        elif r.intent == "sql":
+            # 【第 11 步补丁修的一个真 bug】
+            # 判成"结构化"（因为问句里有"龙门币""多少"这类词），
+            # 却选不出任何 SQL —— 最常见的原因是**问句里没有可识别的干员名**：
+            #   "6星干员精英2升满要多少经验和龙门币"
+            # 问的是全站通用规则，不是某个干员，而 SQL 轨道的入场券就是实体。
+            #
+            # 修之前这里直接带着空 SQL 往下走，两条轨道都空 → 代码级拒答。
+            # 可这些通用数值**已经切成块放进向量库了**（gamedata 来源），
+            # 拒答是错的：不是没有数据，是没走对轨道。
+            #
+            # 教训：**"结构化问题"不等于"能查 SQL"**。
+            # 意图判定和可执行性是两件事，判定完之后必须检查到底能不能落地，
+            # 落不了地要有退路，而不是空手走到拒答分支。
+            r.intent = "semantic"
+            r.reason.append(
+                "结构化问题但选不出 SQL（多半没识别到干员名）→ 降级语义检索")
 
     return r

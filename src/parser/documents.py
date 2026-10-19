@@ -60,6 +60,10 @@ SOURCE_LABEL = {
     "lore_main": "主线剧情",
     "lore_side": "支线剧情",
     "lore_set": "故事集",
+    # 全站通用数值（升级消耗、等级上限、作战记录换算）。
+    # 单独一个 source：它不属于任何干员，混进别的类型会让
+    # "查资料类型"的过滤逻辑彻底失效。
+    "gamedata": "游戏通用数值",
 }
 
 LORE_TYPE2SRC = {"主线": "lore_main", "支线": "lore_side", "剧情": "lore_set"}
@@ -117,7 +121,104 @@ def build_documents(conn: sqlite3.Connection) -> list[dict]:
     docs += _docs_skill(conn, ops)
     docs += _docs_module(conn, ops)
     docs += _docs_lore(conn)
+    docs += _docs_gamedata(conn)
     return docs
+
+
+# ---------------------------------------------------------------------------
+# 9) 游戏通用数值（升级消耗 / 等级上限 / 作战记录换算）
+# ---------------------------------------------------------------------------
+def _docs_gamedata(conn) -> list[dict]:
+    """把全站通用的养成数值也做成可检索的百科条目。
+
+    【为什么需要它：SQL 轨道有一个前提盲区】
+    分阶段养成清单能精确回答"史尔特尔满练度要多少"，
+    但前提是**问句里能识别出干员名**——实体识别是 SQL 轨道的入场券。
+    而"6星干员精英2升满要多少经验"这种不带人名的通用问法没有实体，
+    只能走语义轨道；这些数值页以前根本不在向量库里，结果就是拒答。
+    一个百科不能只支持"点名问"。
+
+    【operator 为什么留空】
+    这是全站通用数据，不属于任何干员。若填成某个干员名，
+    该干员的检索结果就会被一串数字污染 —— 和 lore 块用章节名
+    而不是角色名是同一个道理：**新数据源不能稀释已有检索**。
+    """
+    out: list[dict] = []
+    caps: dict[int, dict[int, int]] = {}
+    try:
+        for rarity, elite, ml in conn.execute(
+                "SELECT rarity, elite, max_level FROM level_cap"):
+            caps.setdefault(rarity, {})[elite] = ml
+    except sqlite3.Error:
+        return out                      # 表不存在（没跑 22 脚本）就跳过
+    if not caps:
+        return out
+
+    # 按**星级分块**而不是拼一大块再切：
+    # ① 一整块会被 chunk_long 粘成一行（"…26719- 精英1 1→80级…"），
+    #    人读不出、模型也容易串行；
+    # ② 分块后问"3星干员升满要多少"能直接命中 3 星那块，
+    #    而不是在一块里混着六个星级 —— 语义检索的精度靠的是块内话题单一。
+    header = ("【游戏数据：干员升级消耗】"
+              "下面的经验值与龙门币消耗对所有干员通用，等级上限随星级不同"
+              "（来源：Wiki「干员升级数值」「干员等级上限」）。")
+    seq = 0
+    for rarity in sorted(caps, reverse=True):
+        lines = [header, "", f"{rarity}星干员："]
+        for elite in sorted(caps[rarity]):
+            ml = caps[rarity][elite]
+            r = conn.execute(
+                "SELECT exp_cum, money_cum FROM level_up_cost "
+                "WHERE elite=? AND level=?", (elite, ml)).fetchone()
+            if not r:
+                continue
+            lines.append(f"- 精英{elite} 1→{ml}级：经验 {r[0]}，龙门币 {r[1]}")
+        text = "\n".join(lines)
+        if len(text.strip()) < MIN_KEEP:
+            continue
+        out.append({
+            "id": f"gamedata:up:{rarity}",
+            "text": text,
+            "metadata": {
+                "operator": "",
+                "source": "gamedata",
+                "source_label": SOURCE_LABEL["gamedata"],
+                "title": f"{rarity}星干员升级消耗",
+                "rarity": rarity,
+                "profession": "",
+                "category": "升级消耗",
+                "seq": seq,
+            },
+        })
+        seq += 1
+
+    # 作战记录换算：经验值要花多少张卡，是玩家的真实问题
+    cards = []
+    try:
+        cards = [(n, v) for n, v in conn.execute(
+            "SELECT name, exp_value FROM exp_card ORDER BY exp_value")]
+    except sqlite3.Error:
+        pass
+    if cards:
+        body = ("【游戏数据：作战记录经验换算】\n"
+                + "\n".join(f"- {n}：提供 {v} 点经验" for n, v in cards)
+                + "\n\n干员升级消耗的是经验值，"
+                  "实际需要用上述作战记录（经验卡）来喂。")
+        out.append({
+            "id": "gamedata:expcard:0",
+            "text": body,
+            "metadata": {
+                "operator": "",
+                "source": "gamedata",
+                "source_label": SOURCE_LABEL["gamedata"],
+                "title": "作战记录经验换算",
+                "rarity": 0,
+                "profession": "",
+                "category": "作战记录",
+                "seq": 0,
+            },
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------
