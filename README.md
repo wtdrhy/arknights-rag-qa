@@ -367,9 +367,8 @@ src/
   store/              SQLite schema / Chroma 向量库
   retriever/          router（规则路由）· hybrid（三路融合）· lexical（BM25）
   generator/          prompt（证据组装）· llm（OpenAI 兼容客户端）
-scripts/              01~21 流水线与工具脚本
-docs/数据质检规范.md    数据质检的方法论
-docs/项目经历.md        简历向的项目复盘（可直接拿去改）
+scripts/              01~22 流水线与工具脚本
+docs/                 方法论文档（数据质检规范等）
 data/                 运行时产物，不入库
 ```
 

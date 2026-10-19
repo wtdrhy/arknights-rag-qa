@@ -20,6 +20,10 @@ data/*
 # 否则别人 clone 下来跑不了 19_regression.py。
 !data/eval_cases.json
 
+# 简历向的个人复盘文档：只留在本地，不随开源仓库分发
+# （内容是写给求职用的，不属于项目本身的技术文档）
+docs/项目经历.md
+
 # 日志
 *.log
 
