@@ -79,6 +79,29 @@ AGGREGATE_HINT = """
 """
 
 
+# 分阶段养成清单（sql_kind="plan"）时追加。
+# 清单按"精英化 → 技能 → 专精 → 模组"分阶段，每行标了材料花在哪个阶段；
+# 末尾【总计】段是数据库 SUM 好的最终值。
+# 另有一条必须声明的边界：升级到各级所需的龙门币/作战记录不在数据里。
+PLAN_HINT = """
+【特别提醒·分阶段养成清单】
+本次【数据表】是一份**分阶段养成清单**，分三层，全部由数据库算好：
+① 明细段（精英化1、精英化2、技能升到2~7级、技能N 专精M、模组N 升到M级）：
+   每行标明该材料花在哪个具体节点；
+② 【小计】段（技能升级2-7级 / 技能N专精 / 模组N）：同一大阶段的合计；
+③ 【总计】段：全阶段合计。
+转述规则：
+- 按「精英化 → 技能升级 → 各技能专精 → 各模组」的顺序分阶段呈现，
+  让用户看清每个阶段花什么。
+- **凡是跨行合并的数字（如技能2-7级合计）一律引用【小计】段的原值，
+  绝对不要自己把几行加起来**——你自己加总容易算错。
+- 【总计】段原样引用，不要验算。
+- 必须在回答末尾注明：升级到各级（1→50 / 1→80 / 1→90 级）所需的
+  龙门币与作战记录（经验）不在本数据表内，表中只含
+  精英化 / 技能升级 / 专精 / 模组的材料消耗。
+"""
+
+
 # 只有 SQL 结果、没有文本证据时追加。
 NO_CITATION_HINT = """
 【特别提醒·本次没有带编号的参考资料】
@@ -225,8 +248,9 @@ def build_messages(question: str,
 
     # ---- 轨道一：结构化数据 ----
     agg = (sql_kind == "aggregate")
+    plan = (sql_kind == "plan")
     if sql_result and sql_result.get("rows"):
-        cap = AGG_ROWS if agg else MAX_ROWS
+        cap = AGG_ROWS if (agg or plan) else MAX_ROWS
         table, cut = fmt_sql_table(sql_result.get("sql", ""),
                                    sql_result.get("columns", []),
                                    sql_result.get("rows", []),
@@ -238,6 +262,13 @@ def build_messages(question: str,
             head = ("【数据表·汇总】来自本地数据库，下列数量已由数据库直接聚合，"
                     "是精确最终值，直接引用、不要重新计算：")
             tail = f"\n（共 {meta['n_rows']} 项，已全部列出）"
+        elif plan:
+            # 分阶段养成清单：行数多但每一行都有用（阶段列是用户要的核心信息），
+            # 截断任何一行都等于丢掉"这材料花在哪"的答案，所以同样不截断。
+            head = ("【数据表·分阶段养成清单】来自本地数据库，按培养阶段排列"
+                    "（精英化 → 技能 → 专精 → 模组），最后一段是全阶段【总计】：")
+            tail = (f"\n（共 {meta['n_rows']} 行，已全部列出）" if not cut
+                    else f"\n（共 {meta['n_rows']} 行，此处展示前 {cap} 行）")
         else:
             head = "【数据表】来自本地数据库，精确值，直接引用不要重新计算："
             tail = (f"\n（共 {meta['n_rows']} 行，此处展示前 {MAX_ROWS} 行）"
@@ -261,6 +292,8 @@ def build_messages(question: str,
         system += WEAK_EVIDENCE_HINT
     if agg:
         system += AGGREGATE_HINT
+    if plan:
+        system += PLAN_HINT
     if not citations:
         # 纯 SQL 轨道：根本没有带编号的参考资料。
         # 但 SYSTEM_PROMPT 里写了"每个结论标证据编号"，模型就会硬编一个 [1]

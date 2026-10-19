@@ -382,6 +382,76 @@ SQL_TEMPLATES = {
         "JOIN operators o ON o.id=m.operator_id WHERE o.name IN ({ph})\n"
         ") t GROUP BY t.material ORDER BY 总数量 DESC"
     ),
+    # 满练度**分阶段养成清单**（第 11 步用户反馈后新增）。
+    #
+    # 用户看不懂一列揉在一起的"总量"——材料花在哪个阶段完全看不出来。
+    # 真实的练度规划是分阶段的：精英化1、精英化2、技能2~7级、
+    # 三个技能各自的专精1~3、每个模组的 1~3 级。
+    #
+    # 输出三段，全部由 SQL 计算，LLM 只转述：
+    #   ① 明细段（a/b/c/d 开头）：每行原始归属，信息无损
+    #   ② 小计段（e 开头）：按大阶段（技能升级2-7合计 / 每个技能的专精合计 /
+    #      每个模组合计）GROUP BY SUM —— 实测模型转述明细时会自己把
+    #      "技能2级卷1×5 + 技能3级卷1×5" 合并成 ×10，恰好对但不可靠；
+    #      合并这种计算必须由 SQL 做，模型引用【小计】段即可
+    #   ③ 总计段（zz）：全阶段 SUM
+    #
+    # ord 列纯粹为了排序（a 精英化 → b 技能 → c 专精 → d 模组 → e 小计 → zz 总计）。
+    # {ph} 出现次数较多（各子查询 + 小计 + 总计段都要按名字过滤），
+    # 调用方按 SQL 里的实际出现次数复制参数，不手写数字。
+    "train_plan": (
+        "SELECT t.阶段 AS 阶段, t.材料 AS 材料, t.数量 AS 数量 FROM (\n"
+        "  SELECT CASE e.stage WHEN '精1' THEN 'a1' ELSE 'a2' END AS ord,\n"
+        "         ('精英化' || substr(e.stage, 2, 1)) AS 阶段,\n"
+        "         e.material AS 材料, e.amount AS 数量\n"
+        "  FROM elite_materials e JOIN operators o ON o.id=e.operator_id "
+        "WHERE o.name IN ({ph})\n"
+        "  UNION ALL SELECT ('b0' || sm.target_level) AS ord,\n"
+        "         ('技能升到' || sm.target_level || '级') AS 阶段,\n"
+        "         sm.material AS 材料, sm.amount AS 数量\n"
+        "  FROM skill_materials sm JOIN operators o ON o.id=sm.operator_id "
+        "WHERE o.name IN ({ph}) AND sm.is_mastery=0\n"
+        "  UNION ALL SELECT ('c' || sm.skill_idx || '0' || sm.mastery_lv) AS ord,\n"
+        "         ('技能' || sm.skill_idx || ' 专精' || sm.mastery_lv) AS 阶段,\n"
+        "         sm.material AS 材料, sm.amount AS 数量\n"
+        "  FROM skill_materials sm JOIN operators o ON o.id=sm.operator_id "
+        "WHERE o.name IN ({ph}) AND sm.is_mastery=1\n"
+        "  UNION ALL SELECT ('d' || m.idx || '0' || mm.level) AS ord,\n"
+        "         ('模组' || m.idx || ' 升到' || mm.level || '级') AS 阶段,\n"
+        "         mm.material AS 材料, mm.amount AS 数量\n"
+        "  FROM module_materials mm JOIN modules m ON m.id=mm.module_id "
+        "JOIN operators o ON o.id=m.operator_id WHERE o.name IN ({ph})\n"
+        "  UNION ALL SELECT 'e0' AS ord, '【小计】技能升级2-7级' AS 阶段,\n"
+        "         s.material AS 材料, s.total AS 数量 FROM (\n"
+        "    SELECT sm.material, SUM(sm.amount) AS total\n"
+        "    FROM skill_materials sm JOIN operators o ON o.id=sm.operator_id "
+        "WHERE o.name IN ({ph}) AND sm.is_mastery=0 GROUP BY sm.material\n"
+        "  ) s\n"
+        "  UNION ALL SELECT ('e' || sm.skill_idx) AS ord,\n"
+        "         ('【小计】技能' || sm.skill_idx || '专精') AS 阶段,\n"
+        "         sm.material AS 材料, SUM(sm.amount) AS 数量\n"
+        "  FROM skill_materials sm JOIN operators o ON o.id=sm.operator_id "
+        "WHERE o.name IN ({ph}) AND sm.is_mastery=1 GROUP BY sm.skill_idx, sm.material\n"
+        "  UNION ALL SELECT ('e4' || m.idx) AS ord,\n"
+        "         ('【小计】模组' || m.idx) AS 阶段,\n"
+        "         mm.material AS 材料, SUM(mm.amount) AS 数量\n"
+        "  FROM module_materials mm JOIN modules m ON m.id=mm.module_id "
+        "JOIN operators o ON o.id=m.operator_id WHERE o.name IN ({ph})\n"
+        "  GROUP BY m.idx, mm.material\n"
+        "  UNION ALL SELECT 'zz' AS ord, '【总计】全阶段合计' AS 阶段,\n"
+        "         g.material AS 材料, g.total AS 数量 FROM (\n"
+        "    SELECT u.material AS material, SUM(u.amount) AS total FROM (\n"
+        "      SELECT e.material, e.amount FROM elite_materials e "
+        "JOIN operators o ON o.id=e.operator_id WHERE o.name IN ({ph})\n"
+        "      UNION ALL SELECT sm.material, sm.amount FROM skill_materials sm "
+        "JOIN operators o ON o.id=sm.operator_id WHERE o.name IN ({ph})\n"
+        "      UNION ALL SELECT mm.material, mm.amount FROM module_materials mm "
+        "JOIN modules m ON m.id=mm.module_id "
+        "JOIN operators o ON o.id=m.operator_id WHERE o.name IN ({ph})\n"
+        "    ) u GROUP BY u.material\n"
+        "  ) g\n"
+        ") t ORDER BY t.ord"
+    ),
 }
 
 # 问"总共/合计/满练度"时的信号词。
@@ -415,8 +485,12 @@ def pick_sql(question: str,
         # "满练度总共要多少材料" 也含"技能"二字，
         # 但用户要的是三表合计，不是技能那一列的流水账。
         if any(w in q for w in TOTAL_SIGNALS):
-            # 三张表各自都要按名字过滤一遍 → 参数重复 3 次
-            return SQL_TEMPLATES["total_material"].format(ph=ph), params * 3, "aggregate"
+            # 分阶段养成清单（带【总计】行）替代纯汇总：
+            # 用户真正想看的是"材料花在哪个阶段"，总量只是顺带的。
+            # {ph} 在模板里出现多次，按实际出现次数复制参数。
+            tpl = SQL_TEMPLATES["train_plan"]
+            n_ph = tpl.count("{ph}")
+            return tpl.format(ph=ph), params * n_ph, "plan"
         if any(w in q for w in ("专精", "技能")):
             return SQL_TEMPLATES["skill_material"].format(ph=ph), params, "detail"
         return SQL_TEMPLATES["elite_material"].format(ph=ph), params, "detail"
